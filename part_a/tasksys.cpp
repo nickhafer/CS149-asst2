@@ -142,46 +142,59 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     // create threads that will spin and check for tasks
     for (int i = 0; i < num_threads; i++)
     {
-        threads[i] = std::thread([this]() {
+        threads[i] = std::thread([this]()
+                                 {
+            // while (true) {
+            //     if (dead) break;
+
+            //     int task_index;
+            //     {
+            //         std::lock_guard<std::mutex> lock(m);
+            //         task_index = next_task.fetch_add(1);
+            //     }
+
+            //     if (task_index >= num_tasks) {
+            //         continue;
+            //     }
+
+            //     member_runnable->runTask(task_index, num_tasks);
+
+            //     {
+            //         std::lock_guard<std::mutex> lock(m);
+            //         tasks_completed.fetch_add(1);
+            //     }
+            // } });
             while (true) {
                 if (dead) break;
 
-                if (member_runnable == nullptr) {
-                    // printf("continuing due to nullptr member runnable\n");
-                    std::this_thread::yield();
+                // Batch task processing
+                int start_task;
+                {
+                    std::lock_guard<std::mutex> lock(m);
+                    start_task = next_task.fetch_add(16); //fetch 16 tasks per thread at once
+                }
+                if (start_task >= num_tasks) {
                     continue;
                 }
 
-                // Check if the task index is within bounds
-                // int task_index = next_task.fetch_add(1); // Increment and get the current value
-                int task_index;
-                {
-                    std::lock_guard<std::mutex> lock(m);
-                    task_index = next_task.fetch_add(1); // Atomic increment
+                int end_task = std::min(start_task + 16, num_tasks);
+                for (int task_index = start_task; task_index < end_task; ++task_index) {
+                    member_runnable->runTask(task_index, num_tasks);
                 }
 
-                if (task_index >= num_tasks) {
-                    // printf("task index when continuing is %d \n", task_index);
-                    std::this_thread::yield();
-                    continue;
-                }
-
-                // printf("task index = %d, num_tasks = %d, tasks_completed = %d\n", task_index, num_tasks, tasks_completed.load());
-
-                // Execute the task
-                member_runnable->runTask(task_index, num_tasks);
-
-                // tasks_completed.fetch_add(1);
                 {
                     std::lock_guard<std::mutex> lock(m);
-                    tasks_completed.fetch_add(1); // Atomic increment
+                    tasks_completed.fetch_add(end_task - start_task);
                 }
             } });
     }
 }
 
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    dead = true;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        dead = true;
+    }
     for (int i = 0; i < num_threads; i++) {
         threads[i].join();
     }
@@ -193,6 +206,7 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
     // method in Part A.  The implementation provided below runs all
     // tasks sequentially on the calling thread.
     //
+    overall_ctr++;
 
     // printf("NEW RUN STARTS WITH ** %d ** TOTAL TASKS and run # %d \n", num_tasks, overall_ctr);
 
@@ -204,16 +218,18 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
         member_runnable = runnable;
     }
 
-    while (true)
-    {
-        if (tasks_completed.load() == num_total_tasks) break; // Exit the loop if all tasks are completed
-        std::this_thread::yield();
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            if (tasks_completed.load() == num_total_tasks) {
+                break;
+            }
+        }
     }
 
-    overall_ctr++;
+    member_runnable = nullptr;
 
     // printf("RUN ENDS WITH ** %d ** TOTAL TASKS and run # %d\n", num_tasks, overall_ctr);
-    member_runnable = nullptr;
 }
 
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
@@ -258,32 +274,35 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     {
         threads[i] = std::thread([this]()
                                  {
-            while (true) {
-                std::unique_lock<std::mutex> lock(m);
+        while (true) {
+            std::unique_lock<std::mutex> lock(m);
 
-                // Sleep until there's work to do or thread pool is shutting down
-                cv_worker.wait(lock, [this]() { 
-                    return dead || (member_runnable != nullptr && next_task < num_tasks); 
-                });
+            // Sleep until there's work to do or thread pool is shutting down
+            cv_worker.wait(lock, [this]() { 
+                return dead || (member_runnable != nullptr && next_task < num_tasks); 
+            });
 
-                if (dead) break;
+            if (dead) break;
 
-                int task_index = next_task++;
-                if (task_index >= num_tasks) {
-                    continue;
-                }
+            // Grab multiple tasks at once to reduce lock contention
+            int start_task = next_task;
+            int tasks_to_take = std::min(32, num_tasks - start_task); // Take up to 32 tasks
+            next_task += tasks_to_take;
 
-                lock.unlock();
-                member_runnable->runTask(task_index, num_tasks);
-                
-                lock.lock();
-                tasks_completed++;
+            lock.unlock();
+            
+            // Process multiple tasks without needing the lock
+            for (int i = 0; i < tasks_to_take; i++) {
+                member_runnable->runTask(start_task + i, num_tasks);
+            }
+                    
+            lock.lock();
+            tasks_completed += tasks_to_take;
 
-                // Notify main thread if all tasks are complete
-                if (tasks_completed == num_tasks) {
-                    cv_main.notify_one();
-                }
-            } });
+            if (tasks_completed == num_tasks) {
+                cv_main.notify_one();
+            }
+        } });
     }
 }
 
